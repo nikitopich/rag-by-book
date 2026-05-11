@@ -61,8 +61,8 @@ def build_dataset(questions: list[dict], api_key: str, model: str, use_hybrid: b
 def main():
     parser = argparse.ArgumentParser(description="RAGAS evaluation для RAG пайплайна")
     parser.add_argument("--api-key", help="OpenRouter API key")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Модель для генерации ответов")
-    parser.add_argument("--judge-model", default="deepseek/deepseek-v4-pro", help="Модель-судья для RAGAS")
+    parser.add_argument("--model", default="openai/gpt-4o", help="Модель для генерации ответов")
+    parser.add_argument("--judge-model", default="openai/gpt-4o", help="Модель-судья для RAGAS")
     parser.add_argument("--dataset", default="eval_dataset.json", help="Путь к датасету")
     parser.add_argument("--output", default=None, help="Сохранить результаты в CSV (опционально)")
     parser.add_argument("--retriever", choices=["hybrid", "vector"], default="hybrid",
