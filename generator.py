@@ -1,5 +1,5 @@
-import anthropic
-from config import ANTHROPIC_API_KEY, LLM_MODEL
+from openai import OpenAI
+from config import OPENROUTER_BASE_URL
 
 SYSTEM_PROMPT = """Ты отвечаешь на вопросы по книге.
                 Используй ТОЛЬКО предоставленный контекст для ответа.
@@ -18,16 +18,18 @@ def build_user_message(query: str, context_chunks: list[str]) -> str:
                     Вопрос: {query}"""
 
 
-def generate_answer(query: str, context_chunks: list[str]) -> str:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+def generate_answer(query: str, context_chunks: list[str], api_key: str, model: str) -> str:
+    client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
 
     user_message = build_user_message(query, context_chunks)
 
-    response = client.messages.create(
-        model=LLM_MODEL,
+    response = client.chat.completions.create(
+        model=model,
         max_tokens=5000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
     )
 
-    return next(block.text for block in response.content if block.type == "text")
+    return response.choices[0].message.content

@@ -1,5 +1,5 @@
-anthropic
+openai
+gradio
 sentence-transformers
 chromadb
 click
-python-dotenv

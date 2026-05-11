@@ -1,16 +1,21 @@
+import getpass
 from chunker import load_and_chunk
 from indexer import index_document
 from retriever import retrieve
 from generator import generate_answer, build_user_message, SYSTEM_PROMPT
+from config import DEFAULT_MODEL
 
 DEBUG = False
 TOP_K = 5
+API_KEY: str = ""
+MODEL: str = DEFAULT_MODEL
 
 HELP_TEXT = """
 Команды:
   /index [файл]   — проиндексировать книгу (по умолчанию aa.txt)
   /debug           — вкл/выкл debug-режим (показывает чанки, scores, промпт)
   /topk <число>    — изменить количество фрагментов (сейчас: {top_k})
+  /model <название> — сменить модель (сейчас: {model})
   /help            — показать эту справку
   /exit            — выйти
 
@@ -19,7 +24,7 @@ HELP_TEXT = """
 
 
 def handle_command(line: str) -> bool:
-    global DEBUG, TOP_K
+    global DEBUG, TOP_K, MODEL
 
     parts = line.split(maxsplit=1)
     cmd = parts[0].lower()
@@ -29,7 +34,7 @@ def handle_command(line: str) -> bool:
         return False
 
     elif cmd == "/help":
-        print(HELP_TEXT.format(top_k=TOP_K))
+        print(HELP_TEXT.format(top_k=TOP_K, model=MODEL))
 
     elif cmd == "/index":
         file_path = parts[1] if len(parts) > 1 else "aa.txt"
@@ -52,6 +57,13 @@ def handle_command(line: str) -> bool:
         else:
             print(f"Текущий top-k: {TOP_K}. Использование: /topk 3\n")
 
+    elif cmd == "/model":
+        if len(parts) > 1:
+            MODEL = parts[1].strip()
+            print(f"Модель: {MODEL}\n")
+        else:
+            print(f"Текущая модель: {MODEL}. Использование: /model openai/gpt-4o-mini\n")
+
     else:
         print(f"Неизвестная команда: {cmd}. Введи /help\n")
 
@@ -59,7 +71,6 @@ def handle_command(line: str) -> bool:
 
 
 def print_debug(question: str, results: dict, context_chunks: list[str]):
-    """Выводит debug-информацию: найденные чанки со scores и итоговый промпт."""
     print("\n" + "=" * 60)
     print("DEBUG: НАЙДЕННЫЕ ЧАНКИ (отсортированы по релевантности)")
     print("=" * 60)
@@ -85,13 +96,20 @@ def ask_question(question: str):
     if DEBUG:
         print_debug(question, results, chunks)
 
-    answer = generate_answer(question, chunks)
+    answer = generate_answer(question, chunks, API_KEY, MODEL)
     print(f"\n{answer}\n")
 
 
 def main():
-    print("📚 RAG-чат с книгой")
-    print("Введи /help для списка команд, или просто задай вопрос.\n")
+    global API_KEY
+
+    print("📚 RAG-чат с книгой (OpenRouter)")
+    API_KEY = getpass.getpass("OpenRouter API Key (sk-or-...): ").strip()
+    if not API_KEY:
+        print("API ключ не введён. Выход.")
+        return
+
+    print(f"Модель: {MODEL}. Введи /help для списка команд.\n")
 
     while True:
         try:
