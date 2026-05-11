@@ -1,0 +1,5 @@
+anthropic
+sentence-transformers
+chromadb
+click
+python-dotenv
