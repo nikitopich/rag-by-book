@@ -4,18 +4,21 @@ from indexer import index_document
 from retriever import retrieve
 from generator import generate_answer, build_user_message, SYSTEM_PROMPT
 from config import DEFAULT_MODEL
+from tracing import setup_tracing
 
 DEBUG = False
 TOP_K = 5
 API_KEY: str = ""
 MODEL: str = DEFAULT_MODEL
+PHOENIX_URL: str = ""
 
 HELP_TEXT = """
 Команды:
-  /index [файл]   — проиндексировать книгу (по умолчанию aa.txt)
+  /index [файл]    — проиндексировать книгу (по умолчанию aa.txt)
   /debug           — вкл/выкл debug-режим (показывает чанки, scores, промпт)
   /topk <число>    — изменить количество фрагментов (сейчас: {top_k})
   /model <название> — сменить модель (сейчас: {model})
+  /phoenix         — показать URL дашборда Phoenix
   /help            — показать эту справку
   /exit            — выйти
 
@@ -64,6 +67,9 @@ def handle_command(line: str) -> bool:
         else:
             print(f"Текущая модель: {MODEL}. Использование: /model openai/gpt-4o-mini\n")
 
+    elif cmd == "/phoenix":
+        print(f"Phoenix UI: {PHOENIX_URL}\n")
+
     else:
         print(f"Неизвестная команда: {cmd}. Введи /help\n")
 
@@ -101,9 +107,13 @@ def ask_question(question: str):
 
 
 def main():
-    global API_KEY
+    global API_KEY, PHOENIX_URL
 
     print("📚 RAG-чат с книгой (OpenRouter)")
+    print("Запускаю Phoenix трейсинг...")
+    PHOENIX_URL = setup_tracing()
+    print(f"Phoenix UI: {PHOENIX_URL}\n")
+
     API_KEY = getpass.getpass("OpenRouter API Key (sk-or-...): ").strip()
     if not API_KEY:
         print("API ключ не введён. Выход.")

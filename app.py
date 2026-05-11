@@ -4,23 +4,9 @@ from generator import generate_answer, build_user_message, SYSTEM_PROMPT
 from chunker import load_and_chunk
 from indexer import index_document
 from config import DEFAULT_MODEL
+from tracing import setup_tracing
 
-AVAILABLE_MODELS = [
-    "openai/gpt-4o-mini",
-    "openai/gpt-4o",
-    "anthropic/claude-haiku-4-5",
-    "anthropic/claude-sonnet-4-5",
-    "google/gemini-flash-1.5",
-    "google/gemini-pro-1.5",
-    "moonshotai/kimi-k2",
-    "deepseek/deepseek-chat",
-    "deepseek/deepseek-r1",
-    "deepseek/deepseek-r1-0528",
-    "qwen/qwen-2.5-72b-instruct",
-    "qwen/qwq-32b",
-    "meta-llama/llama-3.1-8b-instruct",
-    "mistralai/mistral-7b-instruct",
-]
+phoenix_url = setup_tracing()
 
 
 def chat(message: str, history: list, api_key: str, model: str, top_k: int, debug: bool):
@@ -57,7 +43,7 @@ def index_file(file, api_key: str):
 
 
 with gr.Blocks(title="RAG-чат с книгой") as demo:
-    gr.Markdown("# 📚 RAG-чат с книгой\nЗадавай вопросы по проиндексированной книге.")
+    gr.Markdown(f"# 📚 RAG-чат с книгой\nЗадавай вопросы по проиндексированной книге. Phoenix: [{phoenix_url}]({phoenix_url})")
 
     with gr.Row():
         api_key_input = gr.Textbox(
@@ -67,7 +53,29 @@ with gr.Blocks(title="RAG-чат с книгой") as demo:
             scale=3,
         )
         model_selector = gr.Dropdown(
-            choices=AVAILABLE_MODELS,
+            choices=[
+                # OpenAI
+                "openai/gpt-4o-mini",
+                "openai/gpt-4o",
+                # Anthropic
+                "anthropic/claude-haiku-4-5",
+                "anthropic/claude-sonnet-4-5",
+                # Google Gemini
+                "google/gemini-2.0-flash",
+                "google/gemini-2.5-flash-preview",
+                "google/gemini-2.5-pro-preview",
+                # DeepSeek
+                "deepseek/deepseek-chat",
+                "deepseek/deepseek-r1",
+                "deepseek/deepseek-r1-0528",
+                # Qwen
+                "qwen/qwen-2.5-72b-instruct",
+                "qwen/qwq-32b-preview",
+                # Kimi
+                "moonshotai/kimi-k2",
+                # Meta
+                "meta-llama/llama-3.1-8b-instruct",
+            ],
             value=DEFAULT_MODEL,
             label="Модель",
             scale=2,

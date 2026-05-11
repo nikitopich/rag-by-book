@@ -3,3 +3,10 @@ gradio
 sentence-transformers
 chromadb
 click
+arize-phoenix
+openinference-instrumentation-openai
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+ragas
+langchain-openai
+datasets
