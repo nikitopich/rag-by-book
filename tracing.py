@@ -1,3 +1,5 @@
+import socket
+
 import phoenix as px
 from openinference.instrumentation.openai import OpenAIInstrumentor
 from opentelemetry import trace as trace_api
@@ -5,13 +7,26 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk import trace as trace_sdk
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
+PHOENIX_HOST = "localhost"
+PHOENIX_PORT = 6006
+PHOENIX_URL = f"http://{PHOENIX_HOST}:{PHOENIX_PORT}/"
+
+
+def _phoenix_already_running() -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex((PHOENIX_HOST, PHOENIX_PORT)) == 0
+
 
 def setup_tracing() -> str:
-    """Запускает Phoenix UI и подключает трейсинг для OpenAI-клиента.
+    """Подключает Phoenix трейсинг. Если Phoenix уже запущен — переиспользует его.
     Возвращает URL дашборда."""
-    session = px.launch_app()
+    if _phoenix_already_running():
+        base_url = PHOENIX_URL
+    else:
+        session = px.launch_app()
+        base_url = session.url
 
-    endpoint = session.url + "v1/traces"
+    endpoint = base_url + "v1/traces"
     tracer_provider = trace_sdk.TracerProvider()
     tracer_provider.add_span_processor(
         SimpleSpanProcessor(OTLPSpanExporter(endpoint))
@@ -20,4 +35,4 @@ def setup_tracing() -> str:
 
     OpenAIInstrumentor().instrument()
 
-    return session.url
+    return base_url

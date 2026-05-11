@@ -1,5 +1,5 @@
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "openai/gpt-4o-mini"
+DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 CHUNK_SIZE = 1000

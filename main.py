@@ -1,13 +1,14 @@
 import getpass
 from chunker import load_and_chunk
 from indexer import index_document
-from retriever import retrieve
+from retriever import retrieve, hybrid_retrieve
 from generator import generate_answer, build_user_message, SYSTEM_PROMPT
 from config import DEFAULT_MODEL
 from tracing import setup_tracing
 
 DEBUG = False
 TOP_K = 5
+USE_HYBRID = True
 API_KEY: str = ""
 MODEL: str = DEFAULT_MODEL
 PHOENIX_URL: str = ""
@@ -18,6 +19,7 @@ HELP_TEXT = """
   /debug           — вкл/выкл debug-режим (показывает чанки, scores, промпт)
   /topk <число>    — изменить количество фрагментов (сейчас: {top_k})
   /model <название> — сменить модель (сейчас: {model})
+  /mode            — переключить режим retrieval: hybrid / vector (сейчас: {mode})
   /phoenix         — показать URL дашборда Phoenix
   /help            — показать эту справку
   /exit            — выйти
@@ -27,7 +29,7 @@ HELP_TEXT = """
 
 
 def handle_command(line: str) -> bool:
-    global DEBUG, TOP_K, MODEL
+    global DEBUG, TOP_K, MODEL, USE_HYBRID
 
     parts = line.split(maxsplit=1)
     cmd = parts[0].lower()
@@ -37,7 +39,8 @@ def handle_command(line: str) -> bool:
         return False
 
     elif cmd == "/help":
-        print(HELP_TEXT.format(top_k=TOP_K, model=MODEL))
+        mode = "hybrid" if USE_HYBRID else "vector"
+        print(HELP_TEXT.format(top_k=TOP_K, model=MODEL, mode=mode))
 
     elif cmd == "/index":
         file_path = parts[1] if len(parts) > 1 else "aa.txt"
@@ -66,6 +69,11 @@ def handle_command(line: str) -> bool:
             print(f"Модель: {MODEL}\n")
         else:
             print(f"Текущая модель: {MODEL}. Использование: /model openai/gpt-4o-mini\n")
+
+    elif cmd == "/mode":
+        USE_HYBRID = not USE_HYBRID
+        mode = "hybrid (BM25 + Vector)" if USE_HYBRID else "vector only"
+        print(f"Режим retrieval: {mode}\n")
 
     elif cmd == "/phoenix":
         print(f"Phoenix UI: {PHOENIX_URL}\n")
@@ -96,7 +104,7 @@ def print_debug(question: str, results: dict, context_chunks: list[str]):
 
 
 def ask_question(question: str):
-    results = retrieve(question, top_k=TOP_K)
+    results = hybrid_retrieve(question, top_k=TOP_K) if USE_HYBRID else retrieve(question, top_k=TOP_K)
     chunks = results["documents"]
 
     if DEBUG:
