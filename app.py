@@ -22,7 +22,7 @@ from deepeval.metrics import (
 
 from chunker import load_and_chunk
 from config import DEFAULT_MODEL, OPENROUTER_BASE_URL, TOP_K
-from generator import generate_answer, build_user_message, SYSTEM_PROMPT
+from generator import generate_answer, stream_answer, build_user_message, SYSTEM_PROMPT
 from indexer import index_document
 from retriever import retrieve, hybrid_retrieve
 from tracing import setup_tracing
@@ -59,16 +59,28 @@ class OpenRouterLLM(DeepEvalBaseLLM):
         resp = client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
+            max_tokens=4096,
         )
-        return _clean_llm_output(resp.choices[0].message.content)
+        msg = resp.choices[0].message
+        raw = msg.content
+        if not raw:
+            raw = getattr(msg, "reasoning_content", None)
+        return _clean_llm_output(raw)
 
     async def a_generate(self, prompt: str) -> str:
         client = AsyncOpenAI(api_key=self._api_key, base_url=OPENROUTER_BASE_URL)
         resp = await client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
+            max_tokens=4096,
         )
-        return _clean_llm_output(resp.choices[0].message.content)
+        msg = resp.choices[0].message
+        raw = msg.content
+        if not raw:
+            raw = getattr(msg, "reasoning_content", None)
+        cleaned = _clean_llm_output(raw)
+        print(f"[DEBUG judge] raw={repr(raw[:200] if raw else raw)} → cleaned={repr(cleaned[:200])}")
+        return cleaned
 
     def get_model_name(self) -> str:
         return self._model
@@ -76,7 +88,8 @@ class OpenRouterLLM(DeepEvalBaseLLM):
 
 def chat(message: str, history: list, api_key: str, model: str, top_k: int, use_hybrid: bool, debug: bool):
     if not api_key or not api_key.strip():
-        return "Введи OpenRouter API ключ в поле выше"
+        yield "Введи OpenRouter API ключ в поле выше"
+        return
 
     try:
         retriever_fn = hybrid_retrieve if use_hybrid else retrieve
@@ -93,11 +106,13 @@ def chat(message: str, history: list, api_key: str, model: str, top_k: int, use_
             lines.append(f"\n**Промпт:**\n```\n[SYSTEM]\n{SYSTEM_PROMPT}\n\n[USER]\n{build_user_message(message, chunks)}\n```")
             debug_info = "\n".join(lines)
 
-        answer = generate_answer(message, chunks, api_key.strip(), model)
-        return answer + debug_info
+        answer = ""
+        for token in stream_answer(message, chunks, api_key.strip(), model):
+            answer += token
+            yield answer + debug_info
 
     except Exception as e:
-        return f"Ошибка: {type(e).__name__}: {e}"
+        yield f"Ошибка: {type(e).__name__}: {e}"
 
 
 def index_file(file, api_key: str, chunk_size: int, chunk_overlap: int):

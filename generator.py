@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+
 from openai import OpenAI
 from config import OPENROUTER_BASE_URL
 
@@ -18,18 +20,26 @@ def build_user_message(query: str, context_chunks: list[str]) -> str:
                     Вопрос: {query}"""
 
 
-def generate_answer(query: str, context_chunks: list[str], api_key: str, model: str) -> str:
+def _messages(query: str, context_chunks: list[str]) -> list[dict]:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_user_message(query, context_chunks)},
+    ]
+
+
+def stream_answer(query: str, context_chunks: list[str], api_key: str, model: str) -> Iterator[str]:
     client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL, max_retries=5)
-
-    user_message = build_user_message(query, context_chunks)
-
-    response = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model=model,
-        max_tokens=5000,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
+        max_tokens=2000,
+        messages=_messages(query, context_chunks),
+        stream=True,
     )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
 
-    return response.choices[0].message.content
+
+def generate_answer(query: str, context_chunks: list[str], api_key: str, model: str) -> str:
+    return "".join(stream_answer(query, context_chunks, api_key, model))

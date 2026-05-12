@@ -17,6 +17,19 @@ BM25_TOP_N = 15
 VECTOR_TOP_N = 15
 RRF_K = 60
 
+_bm25_cache: tuple[list[str], list[str], "BM25Okapi"] | None = None
+
+
+def _get_bm25(collection) -> tuple[list[str], list[str], "BM25Okapi"]:
+    global _bm25_cache
+    corpus = collection.get(include=["documents"])
+    all_ids: list[str] = corpus["ids"]
+    all_docs: list[str] = corpus["documents"]
+    if _bm25_cache is None or _bm25_cache[0] != all_ids:
+        tokenized = [_tokenize(doc) for doc in all_docs]
+        _bm25_cache = (all_ids, all_docs, BM25Okapi(tokenized))
+    return _bm25_cache
+
 
 def retrieve(query: str, top_k: int = TOP_K) -> dict:
     client = get_chroma_client()
@@ -41,14 +54,9 @@ def hybrid_retrieve(query: str, top_k: int = TOP_K) -> dict:
     client = get_chroma_client()
     collection = client.get_collection(name=COLLECTION_NAME)
 
-    # Fetch full corpus for BM25 indexing
-    corpus = collection.get(include=["documents"])
-    all_ids = corpus["ids"]
-    all_docs = corpus["documents"]
+    all_ids, all_docs, bm25 = _get_bm25(collection)
 
     # BM25 search (with morphological normalization for Russian)
-    tokenized_corpus = [_tokenize(doc) for doc in all_docs]
-    bm25 = BM25Okapi(tokenized_corpus)
     bm25_scores = bm25.get_scores(_tokenize(query))
 
     bm25_top_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:BM25_TOP_N]
