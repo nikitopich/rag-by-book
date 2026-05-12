@@ -18,6 +18,7 @@
 import argparse
 import json
 import getpass
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -40,6 +41,13 @@ from config import DEFAULT_MODEL, OPENROUTER_BASE_URL, TOP_K
 from tracing import setup_tracing
 
 
+def _clean_llm_output(content: str | None) -> str:
+    """Убирает <think>...</think> блоки reasoning-моделей и возвращает непустую строку."""
+    if content is None:
+        return ""
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+
 class OpenRouterLLM(DeepEvalBaseLLM):
     """Обёртка над OpenRouter для использования как судья в DeepEval."""
 
@@ -56,7 +64,7 @@ class OpenRouterLLM(DeepEvalBaseLLM):
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
         )
-        return resp.choices[0].message.content
+        return _clean_llm_output(resp.choices[0].message.content)
 
     async def a_generate(self, prompt: str) -> str:
         client = AsyncOpenAI(api_key=self._api_key, base_url=OPENROUTER_BASE_URL)
@@ -64,7 +72,7 @@ class OpenRouterLLM(DeepEvalBaseLLM):
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
         )
-        return resp.choices[0].message.content
+        return _clean_llm_output(resp.choices[0].message.content)
 
     def get_model_name(self) -> str:
         return self._model
