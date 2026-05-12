@@ -42,10 +42,17 @@ from tracing import setup_tracing
 
 
 def _clean_llm_output(content: str | None) -> str:
-    """Убирает <think>...</think> блоки reasoning-моделей и возвращает непустую строку."""
+    """Возвращает полезный текст из ответа LLM.
+
+    Reasoning-модели (DeepSeek R1, Qwen3) оборачивают мышление в <think>...</think>.
+    DeepEval ожидает чистый JSON — берём текст после </think>.
+    Если после </think> ничего нет (весь ответ внутри блока), возвращаем полный
+    контент: trimAndLoadJson DeepEval сам найдёт { ... } внутри.
+    """
     if content is None:
         return ""
-    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    after_think = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    return after_think if after_think else content.strip()
 
 
 class OpenRouterLLM(DeepEvalBaseLLM):
