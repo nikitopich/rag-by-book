@@ -13,8 +13,8 @@ except ImportError:
     def _tokenize(text: str) -> list[str]:
         return text.lower().split()
 
-BM25_TOP_N = 10
-VECTOR_TOP_N = 10
+BM25_TOP_N = 15
+VECTOR_TOP_N = 15
 RRF_K = 60
 
 
@@ -22,7 +22,7 @@ def retrieve(query: str, top_k: int = TOP_K) -> dict:
     client = get_chroma_client()
     collection = client.get_collection(name=COLLECTION_NAME)
 
-    query_embedding = get_embeddings([query])[0]
+    query_embedding = get_embeddings([query], prefix="query: ")[0]
 
     results = collection.query(
         query_embeddings=[query_embedding],
@@ -55,7 +55,7 @@ def hybrid_retrieve(query: str, top_k: int = TOP_K) -> dict:
     bm25_ranks = {all_ids[i]: rank for rank, i in enumerate(bm25_top_indices)}
 
     # Vector search
-    query_embedding = get_embeddings([query])[0]
+    query_embedding = get_embeddings([query], prefix="query: ")[0]
     vector_results = collection.query(
         query_embeddings=[query_embedding],
         n_results=VECTOR_TOP_N,

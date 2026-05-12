@@ -107,12 +107,18 @@ RRF_score(doc) = Σ 1 / (k + rank_i)
 
 После реализации запустить `eval.py` и сравнить с baseline:
 
-| Метрика | Baseline | Цель |
-|---|---|---|
-| context_precision | 0.243 | > 0.400 |
-| context_recall | 0.367 | > 0.500 |
-| answer_relevancy | 0.089 | > 0.300 |
-| faithfulness | 0.844 | ≥ 0.800 (не регрессировать) |
+| Метрика | Baseline | Цель | Результат | Статус |
+|---|---|---|---|---|
+| context_precision | 0.243 | > 0.400 | 0.192 | ❌ |
+| context_recall | 0.367 | > 0.500 | 0.542 | ✅ |
+| answer_relevancy | 0.089 | > 0.300 | 0.487 | ✅ |
+| faithfulness | 0.844 | ≥ 0.800 | 1.000 | ✅ |
+
+**Конфигурация замера:** answer model `google/gemma-4-31b-it`, judge `deepseek/deepseek-v4-pro`, embedding `intfloat/multilingual-e5-base`, retriever `hybrid`.
+
+> ⚠️ Baseline мерялся с судьёй `openai/gpt-4o`, результаты — с `deepseek/deepseek-v4-pro`. Прямое сравнение приблизительно.
+
+**Вывод:** Замена embedding-модели на `multilingual-e5-base` дала основной прирост — особенно по `context_recall` (+48%) и `answer_relevancy` (+447%). `context_precision` не достиг цели; следующий шаг — reranker (cross-encoder) поверх hybrid retrieval.
 
 ---
 

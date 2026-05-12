@@ -21,6 +21,7 @@ import getpass
 from datetime import datetime
 
 from ragas import evaluate, EvaluationDataset, SingleTurnSample
+from ragas.run_config import RunConfig
 from ragas.metrics._faithfulness import faithfulness
 from ragas.metrics._answer_relevance import answer_relevancy
 from ragas.metrics._context_precision import context_precision
@@ -82,10 +83,15 @@ def main():
     print(f"\nГенерирую ответы для {len(questions)} вопросов (модель: {args.model}, retriever: {retriever_label})...")
     dataset = build_dataset(questions, api_key, args.model, use_hybrid=use_hybrid)
 
+    judge_extra = {}
+    if "qwen3" in args.judge_model.lower():
+        judge_extra = {"model_kwargs": {"extra_body": {"thinking": False}}}
+
     judge_llm = LangchainLLMWrapper(ChatOpenAI(
         model=args.judge_model,
         openai_api_key=api_key,
         openai_api_base=OPENROUTER_BASE_URL,
+        **judge_extra,
     ))
     judge_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
         model="text-embedding-3-small",
@@ -99,6 +105,7 @@ def main():
         metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
         llm=judge_llm,
         embeddings=judge_embeddings,
+        run_config=RunConfig(max_workers=8, timeout=60),
         show_progress=True,
     )
 
@@ -106,8 +113,11 @@ def main():
     print("РЕЗУЛЬТАТЫ RAGAS")
     print("=" * 50)
     for metric, score in result._repr_dict.items():
-        bar = "█" * int(score * 20) + "░" * (20 - int(score * 20))
-        print(f"{metric:<22} {bar}  {score:.3f}")
+        if score != score:  # NaN check
+            print(f"{metric:<22} {'?' * 20}  N/A")
+        else:
+            bar = "█" * int(score * 20) + "░" * (20 - int(score * 20))
+            print(f"{metric:<22} {bar}  {score:.3f}")
     print("=" * 50)
     print("Значения от 0 до 1. Чем выше — тем лучше.\n")
 

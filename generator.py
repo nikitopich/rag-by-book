@@ -19,7 +19,7 @@ def build_user_message(query: str, context_chunks: list[str]) -> str:
 
 
 def generate_answer(query: str, context_chunks: list[str], api_key: str, model: str) -> str:
-    client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+    client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL, max_retries=5)
 
     user_message = build_user_message(query, context_chunks)
 

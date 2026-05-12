@@ -17,8 +17,10 @@ def get_chroma_client():
     return chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
 
-def get_embeddings(texts: list[str]) -> list[list[float]]:
+def get_embeddings(texts: list[str], prefix: str = "") -> list[list[float]]:
     model = get_embedding_model()
+    if prefix:
+        texts = [prefix + t for t in texts]
     embeddings = model.encode(texts, show_progress_bar=False)
     return embeddings.tolist()
 
@@ -41,7 +43,7 @@ def index_document(chunks: list[dict]) -> int:
         ids = [chunk["id"] for chunk in batch]
         metadatas = [chunk["metadata"] for chunk in batch]
 
-        embeddings = get_embeddings(texts)
+        embeddings = get_embeddings(texts, prefix="passage: ")
 
         collection.add(
             ids=ids,
