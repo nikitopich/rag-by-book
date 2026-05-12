@@ -1,20 +1,23 @@
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import gradio as gr
 import pandas as pd
 import phoenix as px
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from openai import OpenAI, AsyncOpenAI
 from openinference.instrumentation.openai import OpenAIInstrumentor
 from phoenix.client import Client as PhoenixClient
-from ragas import EvaluationDataset, SingleTurnSample, evaluate
-from ragas.run_config import RunConfig
-from ragas.embeddings import LangchainEmbeddingsWrapper
-from ragas.llms import LangchainLLMWrapper
-from ragas.metrics._answer_relevance import answer_relevancy
-from ragas.metrics._context_precision import context_precision
-from ragas.metrics._context_recall import context_recall
-from ragas.metrics._faithfulness import faithfulness
+from deepeval import evaluate as deepeval_evaluate
+from deepeval.evaluate.configs import DisplayConfig
+from deepeval.models import DeepEvalBaseLLM
+from deepeval.test_case import LLMTestCase
+from deepeval.metrics import (
+    FaithfulnessMetric,
+    AnswerRelevancyMetric,
+    ContextualPrecisionMetric,
+    ContextualRecallMetric,
+)
 
 from chunker import load_and_chunk
 from config import DEFAULT_MODEL, OPENROUTER_BASE_URL, TOP_K
@@ -24,6 +27,36 @@ from retriever import retrieve, hybrid_retrieve
 from tracing import setup_tracing
 
 phoenix_url = setup_tracing()
+
+
+class OpenRouterLLM(DeepEvalBaseLLM):
+    """Обёртка над OpenRouter для использования как судья в DeepEval."""
+
+    def __init__(self, model: str, api_key: str):
+        self._model = model
+        self._api_key = api_key
+
+    def load_model(self) -> OpenAI:
+        return OpenAI(api_key=self._api_key, base_url=OPENROUTER_BASE_URL)
+
+    def generate(self, prompt: str) -> str:
+        client = self.load_model()
+        resp = client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content
+
+    async def a_generate(self, prompt: str) -> str:
+        client = AsyncOpenAI(api_key=self._api_key, base_url=OPENROUTER_BASE_URL)
+        resp = await client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content
+
+    def get_model_name(self) -> str:
+        return self._model
 
 
 def chat(message: str, history: list, api_key: str, model: str, top_k: int, use_hybrid: bool, debug: bool):
@@ -83,72 +116,79 @@ def run_eval(api_key, model, judge_model, retriever_mode, dataset_file):
 
     yield f"Загружено {len(questions)} вопросов | модель: {model} | retriever: {retriever_label}\n\nГенерирую ответы...\n", gr.update(visible=False)
 
-    samples = []
-    log_lines = []
-    for i, item in enumerate(questions, 1):
-        question = item["question"]
-        reference = item.get("reference", "")
+    # Retrieval — последовательно (ChromaDB не thread-safe)
+    retrieved = []
+    for item in questions:
+        results = retriever_fn(item["question"], top_k=TOP_K)
+        retrieved.append({
+            "question": item["question"],
+            "reference": item.get("reference", ""),
+            "contexts": results["documents"],
+        })
 
-        results = retriever_fn(question, top_k=TOP_K)
-        contexts = results["documents"]
-        answer = generate_answer(question, contexts, api_key.strip(), model)
+    yield f"✓ Retrieval готов для {len(questions)} вопросов\n\nГенерирую ответы параллельно...", gr.update(visible=False)
 
-        samples.append(SingleTurnSample(
-            user_input=question,
-            response=answer,
-            retrieved_contexts=contexts,
-            reference=reference,
-        ))
+    # Генерация — параллельно (HTTP-запросы независимы)
+    def generate_one(entry: dict) -> LLMTestCase:
+        answer = generate_answer(entry["question"], entry["contexts"], api_key.strip(), model)
+        return LLMTestCase(
+            input=entry["question"],
+            actual_output=answer,
+            expected_output=entry["reference"],
+            retrieval_context=entry["contexts"],
+        )
 
-        log_lines.append(f"[{i}/{len(questions)}] ✓ {question[:70]}")
-        yield "\n".join(log_lines) + "\n", gr.update(visible=False)
+    test_cases = [None] * len(retrieved)
+    done_count = 0
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(generate_one, entry): i for i, entry in enumerate(retrieved)}
+        for future in as_completed(futures):
+            i = futures[future]
+            test_cases[i] = future.result()
+            done_count += 1
+            yield f"Генерирую ответы... {done_count}/{len(questions)}\n✓ {retrieved[i]['question'][:70]}", gr.update(visible=False)
 
-    log_lines.append(f"\nОцениваю с RAGAS (судья: {judge_model})...")
+    log_lines = [f"✓ Сгенерировано {len(questions)} ответов"]
+
+    log_lines.append(f"\nОцениваю с DeepEval (судья: {judge_model})...")
     yield "\n".join(log_lines), gr.update(visible=False)
 
-    # Qwen3 models enable chain-of-thought thinking by default — RAGAS can't parse
-    # <think>...</think> blocks, resulting in zero scores. Disable it for the judge.
-    judge_extra = {}
-    if "qwen3" in judge_model.lower():
-        judge_extra = {"model_kwargs": {"extra_body": {"thinking": False}}}
+    judge = OpenRouterLLM(model=judge_model, api_key=api_key.strip())
+    metrics = [
+        FaithfulnessMetric(threshold=0.5, model=judge, include_reason=True),
+        AnswerRelevancyMetric(threshold=0.5, model=judge, include_reason=True),
+        ContextualPrecisionMetric(threshold=0.5, model=judge, include_reason=True),
+        ContextualRecallMetric(threshold=0.5, model=judge, include_reason=True),
+    ]
 
-    judge_llm = LangchainLLMWrapper(ChatOpenAI(
-        model=judge_model,
-        openai_api_key=api_key.strip(),
-        openai_api_base=OPENROUTER_BASE_URL,
-        **judge_extra,
-    ))
-    judge_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=api_key.strip(),
-        openai_api_base=OPENROUTER_BASE_URL,
-    ))
-
-    # Uninstrument to avoid flooding Phoenix with RAGAS internal LLM calls (~25/question)
+    # Uninstrument to avoid flooding Phoenix with DeepEval internal LLM calls
     OpenAIInstrumentor().uninstrument()
     try:
-        result = evaluate(
-            dataset=EvaluationDataset(samples),
-            metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
-            llm=judge_llm,
-            embeddings=judge_embeddings,
-            run_config=RunConfig(max_workers=8, timeout=60),
-        )
+        eval_result = deepeval_evaluate(test_cases, metrics, display_config=DisplayConfig(print_results=False))
     finally:
         OpenAIInstrumentor().instrument()
 
-    scores_lines = ["\n" + "=" * 50, "РЕЗУЛЬТАТЫ RAGAS", "=" * 50]
-    for metric, score in result._repr_dict.items():
-        if score != score:  # NaN check
-            scores_lines.append(f"{metric:<22} {'?' * 20}  N/A")
-        else:
-            bar = "█" * int(score * 20) + "░" * (20 - int(score * 20))
-            scores_lines.append(f"{metric:<22} {bar}  {score:.3f}")
-    scores_lines.append("=" * 50)
+    metric_scores: dict[str, list[float]] = {}
+    rows = []
+    for tr in eval_result.test_results:
+        row = {"user_input": tr.input, "response": tr.actual_output}
+        for md in tr.metrics_data:
+            if md.score is not None:
+                row[md.name] = md.score
+                metric_scores.setdefault(md.name, []).append(md.score)
+        rows.append(row)
+
+    scores_lines = ["\n" + "=" * 54, "РЕЗУЛЬТАТЫ DEEPEVAL", "=" * 54]
+    for metric_name, scores in metric_scores.items():
+        avg = sum(scores) / len(scores)
+        bar = "█" * int(avg * 20) + "░" * (20 - int(avg * 20))
+        scores_lines.append(f"{metric_name:<30} {bar}  {avg:.3f}")
+    scores_lines.append("=" * 54)
+
+    df = pd.DataFrame(rows)
 
     # Save to Phoenix datasets
     try:
-        df = result.to_pandas()
         client = PhoenixClient()
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         model_slug = model.split("/")[-1]
@@ -163,7 +203,6 @@ def run_eval(api_key, model, judge_model, retriever_mode, dataset_file):
         scores_lines.append(f"   Открыть: {phoenix_url}datasets")
     except Exception as e:
         scores_lines.append(f"\n⚠️  Не удалось сохранить в Phoenix: {e}")
-        df = result.to_pandas()
 
     yield "\n".join(log_lines + scores_lines), gr.update(value=df, visible=True)
 
@@ -243,7 +282,7 @@ with gr.Blocks(title="RAG-чат с книгой") as demo:
 
         with gr.Tab("🔬 Оценка"):
             gr.Markdown(
-                "Запускает RAGAS-оценку и сохраняет результаты в Phoenix как датасет.\n"
+                "Запускает DeepEval-оценку и сохраняет результаты в Phoenix как датасет.\n"
                 f"Посмотреть датасеты: [{phoenix_url}datasets]({phoenix_url}datasets)"
             )
 
@@ -301,7 +340,9 @@ with gr.Blocks(title="RAG-чат с книгой") as demo:
                 file_types=[".json"],
             )
 
-            run_eval_btn = gr.Button("▶ Запустить оценку", variant="primary", size="lg")
+            with gr.Row():
+                run_eval_btn = gr.Button("▶ Запустить оценку", variant="primary", size="lg")
+                stop_eval_btn = gr.Button("⏹ Остановить", variant="stop", size="lg")
 
             eval_log = gr.Textbox(
                 label="Прогресс",
@@ -315,11 +356,12 @@ with gr.Blocks(title="RAG-чат с книгой") as demo:
                 wrap=True,
             )
 
-            run_eval_btn.click(
+            run_event = run_eval_btn.click(
                 fn=run_eval,
                 inputs=[api_key_input, eval_answer_model_dropdown, judge_model_dropdown, eval_retriever_radio, eval_dataset_file],
                 outputs=[eval_log, eval_table],
             )
+            stop_eval_btn.click(fn=None, cancels=[run_event])
 
 
 if __name__ == "__main__":

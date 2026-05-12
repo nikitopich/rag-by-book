@@ -7,9 +7,7 @@ arize-phoenix
 openinference-instrumentation-openai
 opentelemetry-sdk
 opentelemetry-exporter-otlp
-ragas
-langchain-openai
-datasets
+deepeval
 rank_bm25
 pymorphy3
 pymorphy3-dicts-ru

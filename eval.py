@@ -1,5 +1,5 @@
 """
-Оценка качества RAG пайплайна с помощью RAGAS.
+Оценка качества RAG пайплайна с помощью DeepEval.
 
 Использование:
     python eval.py --api-key sk-or-v1-...
@@ -9,26 +9,30 @@
     2. Заполни eval_dataset.json своими вопросами и правильными ответами
 
 Метрики:
-    - faithfulness:       ответ основан только на найденных чанках (не галлюцинирует)
-    - answer_relevancy:   ответ по существу вопроса
-    - context_precision:  найденные чанки действительно релевантны вопросу
-    - context_recall:     все нужные факты присутствуют в найденных чанках
+    - Faithfulness:          ответ основан только на найденных чанках (не галлюцинирует)
+    - Answer Relevancy:      ответ по существу вопроса
+    - Contextual Precision:  найденные чанки действительно релевантны вопросу
+    - Contextual Recall:     все нужные факты присутствуют в найденных чанках
 """
 
 import argparse
 import json
 import getpass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from ragas import evaluate, EvaluationDataset, SingleTurnSample
-from ragas.run_config import RunConfig
-from ragas.metrics._faithfulness import faithfulness
-from ragas.metrics._answer_relevance import answer_relevancy
-from ragas.metrics._context_precision import context_precision
-from ragas.metrics._context_recall import context_recall
-from ragas.llms import LangchainLLMWrapper
-from ragas.embeddings import LangchainEmbeddingsWrapper
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+import pandas as pd
+from openai import OpenAI, AsyncOpenAI
+from deepeval import evaluate
+from deepeval.evaluate.configs import DisplayConfig
+from deepeval.models import DeepEvalBaseLLM
+from deepeval.test_case import LLMTestCase
+from deepeval.metrics import (
+    FaithfulnessMetric,
+    AnswerRelevancyMetric,
+    ContextualPrecisionMetric,
+    ContextualRecallMetric,
+)
 
 from retriever import retrieve, hybrid_retrieve
 from generator import generate_answer
@@ -36,38 +40,85 @@ from config import DEFAULT_MODEL, OPENROUTER_BASE_URL, TOP_K
 from tracing import setup_tracing
 
 
-def build_dataset(questions: list[dict], api_key: str, model: str, use_hybrid: bool = True) -> EvaluationDataset:
+class OpenRouterLLM(DeepEvalBaseLLM):
+    """Обёртка над OpenRouter для использования как судья в DeepEval."""
+
+    def __init__(self, model: str, api_key: str):
+        self._model = model
+        self._api_key = api_key
+
+    def load_model(self) -> OpenAI:
+        return OpenAI(api_key=self._api_key, base_url=OPENROUTER_BASE_URL)
+
+    def generate(self, prompt: str) -> str:
+        client = self.load_model()
+        resp = client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content
+
+    async def a_generate(self, prompt: str) -> str:
+        client = AsyncOpenAI(api_key=self._api_key, base_url=OPENROUTER_BASE_URL)
+        resp = await client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content
+
+    def get_model_name(self) -> str:
+        return self._model
+
+
+def build_test_cases(
+    questions: list[dict], api_key: str, model: str, use_hybrid: bool = True, max_workers: int = 5
+) -> list[LLMTestCase]:
     retriever_fn = hybrid_retrieve if use_hybrid else retrieve
-    samples = []
-    for i, item in enumerate(questions, 1):
-        question = item["question"]
-        reference = item.get("reference", "")
 
-        print(f"[{i}/{len(questions)}] {question}")
+    # Retrieval — последовательно (ChromaDB не thread-safe)
+    retrieved = []
+    for item in questions:
+        results = retriever_fn(item["question"], top_k=TOP_K)
+        retrieved.append({
+            "question": item["question"],
+            "reference": item.get("reference", ""),
+            "contexts": results["documents"],
+        })
 
-        results = retriever_fn(question, top_k=TOP_K)
-        contexts = results["documents"]
-        answer = generate_answer(question, contexts, api_key, model)
+    # Генерация — параллельно (HTTP-запросы независимы)
+    def generate_one(entry: dict) -> LLMTestCase:
+        answer = generate_answer(entry["question"], entry["contexts"], api_key, model)
+        return LLMTestCase(
+            input=entry["question"],
+            actual_output=answer,
+            expected_output=entry["reference"],
+            retrieval_context=entry["contexts"],
+        )
 
-        samples.append(SingleTurnSample(
-            user_input=question,
-            response=answer,
-            retrieved_contexts=contexts,
-            reference=reference,
-        ))
-
-    return EvaluationDataset(samples=samples)
+    test_cases = [None] * len(retrieved)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(generate_one, entry): i for i, entry in enumerate(retrieved)}
+        for future in as_completed(futures):
+            i = futures[future]
+            test_cases[i] = future.result()
+            done = sum(tc is not None for tc in test_cases)
+            print(f"[{done}/{len(questions)}] {retrieved[i]['question']}")
+    return test_cases
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RAGAS evaluation для RAG пайплайна")
+    parser = argparse.ArgumentParser(description="DeepEval оценка для RAG пайплайна")
     parser.add_argument("--api-key", help="OpenRouter API key")
     parser.add_argument("--model", default="openai/gpt-4o", help="Модель для генерации ответов")
-    parser.add_argument("--judge-model", default="openai/gpt-4o", help="Модель-судья для RAGAS")
+    parser.add_argument("--judge-model", default="openai/gpt-4o", help="Модель-судья для DeepEval")
     parser.add_argument("--dataset", default="eval_dataset.json", help="Путь к датасету")
     parser.add_argument("--output", default=None, help="Сохранить результаты в CSV (опционально)")
-    parser.add_argument("--retriever", choices=["hybrid", "vector"], default="hybrid",
-                        help="Режим retrieval: hybrid (BM25+Vector, по умолчанию) или vector")
+    parser.add_argument(
+        "--retriever",
+        choices=["hybrid", "vector"],
+        default="hybrid",
+        help="Режим retrieval: hybrid (BM25+Vector, по умолчанию) или vector",
+    )
     args = parser.parse_args()
 
     phoenix_url = setup_tracing()
@@ -81,48 +132,41 @@ def main():
     use_hybrid = args.retriever == "hybrid"
     retriever_label = "hybrid (BM25 + Vector)" if use_hybrid else "vector only"
     print(f"\nГенерирую ответы для {len(questions)} вопросов (модель: {args.model}, retriever: {retriever_label})...")
-    dataset = build_dataset(questions, api_key, args.model, use_hybrid=use_hybrid)
+    test_cases = build_test_cases(questions, api_key, args.model, use_hybrid=use_hybrid)
 
-    judge_extra = {}
-    if "qwen3" in args.judge_model.lower():
-        judge_extra = {"model_kwargs": {"extra_body": {"thinking": False}}}
+    judge = OpenRouterLLM(model=args.judge_model, api_key=api_key)
+    metrics = [
+        FaithfulnessMetric(threshold=0.5, model=judge, include_reason=True),
+        AnswerRelevancyMetric(threshold=0.5, model=judge, include_reason=True),
+        ContextualPrecisionMetric(threshold=0.5, model=judge, include_reason=True),
+        ContextualRecallMetric(threshold=0.5, model=judge, include_reason=True),
+    ]
 
-    judge_llm = LangchainLLMWrapper(ChatOpenAI(
-        model=args.judge_model,
-        openai_api_key=api_key,
-        openai_api_base=OPENROUTER_BASE_URL,
-        **judge_extra,
-    ))
-    judge_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=api_key,
-        openai_api_base=OPENROUTER_BASE_URL,
-    ))
+    print(f"\nОцениваю с помощью DeepEval (судья: {args.judge_model})...")
+    results = evaluate(test_cases, metrics, display_config=DisplayConfig(print_results=False))
 
-    print(f"\nОцениваю с помощью RAGAS (судья: {args.judge_model})...")
-    result = evaluate(
-        dataset=dataset,
-        metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
-        llm=judge_llm,
-        embeddings=judge_embeddings,
-        run_config=RunConfig(max_workers=8, timeout=60),
-        show_progress=True,
-    )
+    metric_scores: dict[str, list[float]] = {}
+    rows = []
+    for tr in results.test_results:
+        row = {"question": tr.input}
+        for md in tr.metrics_data:
+            if md.score is not None:
+                row[md.name] = md.score
+                metric_scores.setdefault(md.name, []).append(md.score)
+        rows.append(row)
 
-    print("\n" + "=" * 50)
-    print("РЕЗУЛЬТАТЫ RAGAS")
-    print("=" * 50)
-    for metric, score in result._repr_dict.items():
-        if score != score:  # NaN check
-            print(f"{metric:<22} {'?' * 20}  N/A")
-        else:
-            bar = "█" * int(score * 20) + "░" * (20 - int(score * 20))
-            print(f"{metric:<22} {bar}  {score:.3f}")
-    print("=" * 50)
+    print("\n" + "=" * 54)
+    print("РЕЗУЛЬТАТЫ DEEPEVAL")
+    print("=" * 54)
+    for metric_name, scores in metric_scores.items():
+        avg = sum(scores) / len(scores)
+        bar = "█" * int(avg * 20) + "░" * (20 - int(avg * 20))
+        print(f"{metric_name:<30} {bar}  {avg:.3f}")
+    print("=" * 54)
     print("Значения от 0 до 1. Чем выше — тем лучше.\n")
 
     output = args.output or f"eval_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    result.to_pandas().to_csv(output, index=False)
+    pd.DataFrame(rows).to_csv(output, index=False)
     print(f"Детальные результаты сохранены в {output}")
 
 
