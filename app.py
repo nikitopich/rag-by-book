@@ -1,7 +1,13 @@
+import asyncio
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+
+# Must be set BEFORE importing deepeval — overrides default 180s per-task timeout.
+# A test case with 4 metrics × several judge calls each can easily exceed 180s on slow providers.
+os.environ.setdefault("DEEPEVAL_PER_TASK_TIMEOUT_SECONDS_OVERRIDE", "600")
 
 import gradio as gr
 import pandas as pd
@@ -10,7 +16,7 @@ from openai import OpenAI, AsyncOpenAI
 from openinference.instrumentation.openai import OpenAIInstrumentor
 from phoenix.client import Client as PhoenixClient
 from deepeval import evaluate as deepeval_evaluate
-from deepeval.evaluate.configs import DisplayConfig
+from deepeval.evaluate.configs import DisplayConfig, ErrorConfig
 from deepeval.models import DeepEvalBaseLLM
 from deepeval.test_case import LLMTestCase
 from deepeval.metrics import (
@@ -24,7 +30,7 @@ from chunker import load_and_chunk
 from config import DEFAULT_MODEL, OPENROUTER_BASE_URL, TOP_K
 from generator import generate_answer, stream_answer, build_user_message, SYSTEM_PROMPT
 from indexer import index_document
-from retriever import retrieve, hybrid_retrieve
+from retriever import retrieve, hybrid_retrieve, hybrid_retrieve_reranked
 from tracing import setup_tracing
 
 phoenix_url = setup_tracing()
@@ -34,14 +40,62 @@ def _clean_llm_output(content: str | None) -> str:
     """Возвращает полезный текст из ответа LLM.
 
     Reasoning-модели (DeepSeek R1, Qwen3) оборачивают мышление в <think>...</think>.
-    DeepEval ожидает чистый JSON — берём текст после </think>.
-    Если после </think> ничего нет (весь ответ внутри блока), возвращаем полный
-    контент: trimAndLoadJson DeepEval сам найдёт { ... } внутри.
+    Instruction-модели часто оборачивают JSON в markdown-фенсы ```json ... ```.
+    Без response_format модель может добавить пояснения до/после JSON.
+    Снимаем все обёртки — DeepEval ожидает чистый JSON.
     """
     if content is None:
         return ""
     after_think = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-    return after_think if after_think else content.strip()
+    text = after_think if after_think else content.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    # If text isn't already JSON, try to extract first balanced {...}.
+    if text and text[0] not in "{[":
+        extracted = _extract_first_json(text)
+        if extracted:
+            text = extracted
+    return text
+
+
+def _extract_first_json(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _is_valid_json(text: str) -> bool:
+    if not text:
+        return False
+    try:
+        json.loads(text)
+        return True
+    except (json.JSONDecodeError, ValueError):
+        return False
 
 
 class OpenRouterLLM(DeepEvalBaseLLM):
@@ -54,45 +108,85 @@ class OpenRouterLLM(DeepEvalBaseLLM):
     def load_model(self) -> OpenAI:
         return OpenAI(api_key=self._api_key, base_url=OPENROUTER_BASE_URL)
 
-    def generate(self, prompt: str) -> str:
-        client = self.load_model()
-        resp = client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=4096,
-        )
-        msg = resp.choices[0].message
+    def _parse_response(self, resp) -> tuple[str | None, str | None]:
+        """Извлекает content и finish_reason из ответа OpenAI SDK.
+
+        OpenRouter иногда возвращает {"error": ...} без поля choices — SDK не валидирует
+        и оставляет resp.choices = None. В этом случае возвращаем (None, "no_choices").
+        """
+        if resp is None or not getattr(resp, "choices", None):
+            err = getattr(resp, "error", None) or getattr(resp, "model_extra", {}).get("error")
+            return None, f"no_choices ({err})" if err else "no_choices"
+        choice = resp.choices[0]
+        msg = choice.message
         raw = msg.content
         if not raw:
             raw = getattr(msg, "reasoning_content", None)
-        return _clean_llm_output(raw)
+        return raw, choice.finish_reason
+
+    def generate(self, prompt: str) -> str:
+        client = self.load_model()
+        cleaned = ""
+        for attempt in range(4):
+            kwargs = dict(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=8192,
+            )
+            if attempt < 2:
+                kwargs["response_format"] = {"type": "json_object"}
+            try:
+                resp = client.chat.completions.create(**kwargs)
+            except Exception as e:
+                print(f"[DEBUG judge] sync attempt {attempt + 1} API error: {type(e).__name__}: {e}")
+                continue
+            raw, finish = self._parse_response(resp)
+            cleaned = _clean_llm_output(raw)
+            if _is_valid_json(cleaned):
+                return cleaned
+            print(f"[DEBUG judge] invalid JSON on sync attempt {attempt + 1} (json_mode={attempt < 2}, finish={finish}, len={len(raw or '')})")
+        return cleaned or "{}"
 
     async def a_generate(self, prompt: str) -> str:
         client = AsyncOpenAI(api_key=self._api_key, base_url=OPENROUTER_BASE_URL)
-        resp = await client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=4096,
-        )
-        msg = resp.choices[0].message
-        raw = msg.content
-        if not raw:
-            raw = getattr(msg, "reasoning_content", None)
-        cleaned = _clean_llm_output(raw)
-        print(f"[DEBUG judge] raw={repr(raw[:200] if raw else raw)} → cleaned={repr(cleaned[:200])}")
+        cleaned = ""
+        for attempt in range(4):
+            kwargs = dict(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=8192,
+            )
+            # Last two attempts go without response_format — some prompts make DeepSeek
+            # silently return empty content in JSON mode.
+            if attempt < 2:
+                kwargs["response_format"] = {"type": "json_object"}
+            try:
+                resp = await client.chat.completions.create(**kwargs)
+            except Exception as e:
+                print(f"[DEBUG judge] attempt={attempt + 1} API error: {type(e).__name__}: {e}")
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raw, finish = self._parse_response(resp)
+            cleaned = _clean_llm_output(raw)
+            valid = _is_valid_json(cleaned)
+            print(f"[DEBUG judge] attempt={attempt + 1} json_mode={attempt < 2} finish={finish} len={len(raw or '')} valid_json={valid} raw={repr((raw or '')[:200])}")
+            if valid:
+                return cleaned
+            await asyncio.sleep(2 ** attempt)
+        return cleaned or "{}"
         return cleaned
 
     def get_model_name(self) -> str:
         return self._model
 
 
-def chat(message: str, history: list, api_key: str, model: str, top_k: int, use_hybrid: bool, debug: bool):
+def chat(message: str, history: list, api_key: str, model: str, top_k: int, use_hybrid: str, debug: bool):
     if not api_key or not api_key.strip():
         yield "Введи OpenRouter API ключ в поле выше"
         return
 
     try:
-        retriever_fn = hybrid_retrieve if use_hybrid else retrieve
+        retriever_fn = {"hybrid": hybrid_retrieve, "hybrid+rerank": hybrid_retrieve_reranked}.get(use_hybrid, retrieve)
         results = retriever_fn(message, top_k=int(top_k))
         chunks = results["documents"]
 
@@ -140,9 +234,8 @@ def run_eval(api_key, model, judge_model, retriever_mode, dataset_file):
             yield "Файл eval_dataset.json не найден. Загрузи датасет через поле выше.", gr.update(visible=False)
             return
 
-    use_hybrid = retriever_mode == "hybrid"
-    retriever_fn = hybrid_retrieve if use_hybrid else retrieve
-    retriever_label = "hybrid (BM25 + Vector)" if use_hybrid else "vector only"
+    retriever_fn = {"hybrid": hybrid_retrieve, "hybrid+rerank": hybrid_retrieve_reranked}.get(retriever_mode, retrieve)
+    retriever_label = {"hybrid": "hybrid (BM25 + Vector)", "hybrid+rerank": "hybrid + reranker"}.get(retriever_mode, "vector only")
 
     yield f"Загружено {len(questions)} вопросов | модель: {model} | retriever: {retriever_label}\n\nГенерирую ответы...\n", gr.update(visible=False)
 
@@ -194,7 +287,12 @@ def run_eval(api_key, model, judge_model, retriever_mode, dataset_file):
     # Uninstrument to avoid flooding Phoenix with DeepEval internal LLM calls
     OpenAIInstrumentor().uninstrument()
     try:
-        eval_result = deepeval_evaluate(test_cases, metrics, display_config=DisplayConfig(print_results=False))
+        eval_result = deepeval_evaluate(
+            test_cases,
+            metrics,
+            display_config=DisplayConfig(print_results=False),
+            error_config=ErrorConfig(ignore_errors=True),
+        )
     finally:
         OpenAIInstrumentor().instrument()
 
@@ -283,8 +381,8 @@ with gr.Blocks(title="RAG-чат с книгой") as demo:
                 )
                 top_k_slider = gr.Slider(minimum=1, maximum=20, value=5, step=1, label="Top-K фрагментов", scale=1)
                 retriever_toggle = gr.Radio(
-                    choices=["hybrid", "vector"],
-                    value="hybrid",
+                    choices=["hybrid+rerank", "hybrid", "vector"],
+                    value="hybrid+rerank",
                     label="Retriever",
                 )
                 debug_checkbox = gr.Checkbox(label="Debug-режим", value=False)
@@ -365,8 +463,8 @@ with gr.Blocks(title="RAG-чат с книгой") as demo:
                     label="Судья (judge model)",
                 )
                 eval_retriever_radio = gr.Radio(
-                    choices=["hybrid", "vector"],
-                    value="hybrid",
+                    choices=["hybrid+rerank", "hybrid", "vector"],
+                    value="hybrid+rerank",
                     label="Retriever",
                 )
 
